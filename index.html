@@ -49,7 +49,7 @@
         async function callClaude(prompt) {
             const res = await fetch("https://api.openai.com/v1/chat/completions", {
                 method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": `Bearer ` },
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey} ` },
                 body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: 1000 }),
             });
             const data = await res.json();
@@ -214,7 +214,12 @@
                                             <>
                                                 <button onClick={() => speak(c.word)} style={{ ...btnStyle("#6366f1"), marginBottom: 10 }}>🔊 발음 듣기</button>
                                                 <p style={{ margin: "0 0 8px", fontSize: 13, color: "#475569", fontWeight: 600 }}>예문</p>
-                                                {(c.examples || []).map((ex, i) => <p key={i} style={{ margin: "0 0 6px", fontSize: 13, color: "#334155", lineHeight: 1.6 }}>{i + 1}. {ex}</p>)}
+                                                {(c.examples || []).map((ex, i) => (
+                                                    <div key={i} style={{ margin: "0 0 10px" }}>
+                                                        <p style={{ margin: 0, fontSize: 13, color: "#334155", lineHeight: 1.6 }}>{i + 1}. {ex.en || ex}</p>
+                                                        {ex.ko && <p style={{ margin: "2px 0 0 16px", fontSize: 12, color: "#64748b", lineHeight: 1.5 }}>{ex.ko}</p>}
+                                                    </div>
+                                                ))}
                                             </>
                                         ) : (
                                             <p style={{ margin: 0, fontSize: 13, color: "#334155", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{c.description}</p>
@@ -294,7 +299,7 @@
                 if (!word.trim()) { setMsg("단어를 먼저 입력해주세요."); return; }
                 setLoading(true); setMsg("AI가 예문을 생성하는 중…");
                 try {
-                    const raw = await callClaude(`영어 단어 "${word.trim()}"에 대해 다음 JSON만 반환해. 다른 텍스트 없이.\n{"meaning":"한국어 뜻","examples":["예문1","예문2","예문3","예문4","예문5"]}`);
+                    const raw = await callClaude(`영어 단어 "${word.trim()}"에 대해 다음 JSON만 반환해. 다른 텍스트 없이.\n{"meaning":"한국어 뜻","examples":[{"en":"영어 예문1","ko":"한국어 번역1"},{"en":"영어 예문2","ko":"한국어 번역2"},{"en":"영어 예문3","ko":"한국어 번역3"},{"en":"영어 예문4","ko":"한국어 번역4"},{"en":"영어 예문5","ko":"한국어 번역5"}]}`);
                     const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
                     setMeaning(parsed.meaning || ""); setEx((parsed.examples || []).slice(0, 5));
                     setMsg("✅ 자동 완성 완료!");
@@ -430,7 +435,12 @@
                                 {card.type === "word" ? (
                                     <>
                                         <p style={{ marginBottom: 8, fontWeight: 700, fontSize: 18 }}>{card.meaning}</p>
-                                        {(card.examples || []).map((ex, i) => <p key={i} style={{ margin: "4px 0", fontSize: 13, color: "#374151" }}>{i + 1}. {ex}</p>)}
+                                        {(card.examples || []).map((ex, i) => (
+                                            <div key={i} style={{ margin: "4px 0" }}>
+                                                <p style={{ margin: 0, fontSize: 13, color: "#374151" }}>{i + 1}. {ex.en || ex}</p>
+                                                {ex.ko && <p style={{ margin: "2px 0 0 16px", fontSize: 12, color: "#64748b" }}>{ex.ko}</p>}
+                                            </div>
+                                        ))}
                                     </>
                                 ) : (
                                     <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{card.description}</p>
