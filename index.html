@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>나의 암기장</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f8fafc;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback } = React;
+
+        const OPENAI_KEY_STORAGE = "flashcard-openai-key";
+        const SUPABASE_URL = "https://bumaptnummnldblzkgek.supabase.co";
+        const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ1bWFwdG51bW1ubGRibHprZ2VrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyNTkzNDYsImV4cCI6MjA4ODgzNTM0Nn0.HKtUw9XvUaxjLWadkB1cLrbnp1TpNsSOOiOBAHZs5d4";
+        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+        // ── DB helpers ────────────────────────────────────────────────────────────────
+        const db = {
+            getCards: async () => { const { data, error } = await supabase.from("cards").select("*").order("created_at", { ascending: false }); if (error) throw error; return data; },
+            getCategories: async () => { const { data, error } = await supabase.from("categories").select("name").order("name"); if (error) throw error; return data.map(r => r.name); },
+            addCard: async (c) => { const { error } = await supabase.from("cards").insert(c); if (error) throw error; },
+            updateCard: async (id, c) => { const { error } = await supabase.from("cards").update(c).eq("id", id); if (error) throw error; },
+            deleteCard: async (id) => { const { error } = await supabase.from("cards").delete().eq("id", id); if (error) throw error; },
+            addCategory: async (n) => { const { error } = await supabase.from("categories").insert({ name: n }); if (error) throw error; },
+            deleteCategory: async (n) => { const { error } = await supabase.from("categories").delete().eq("name", n); if (error) throw error; },
+        };
+
+        // ── Claude API ────────────────────────────────────────────────────────────────
+        async function callClaude(prompt) {
+            const res = await fetch("https://api.openai.com/v1/chat/completions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ` },
+                body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: prompt }], max_tokens: 1000 }),
+            });
+            const data = await res.json();
+            return data.choices?.[0]?.message?.content ?? "";
+        }
+
+        // ── TTS ───────────────────────────────────────────────────────────────────────
+        function speak(text) {
+            if (!window.speechSynthesis) return;
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = "en-US"; u.rate = 0.9;
+            const trySpeak = () => {
+                const voices = window.speechSynthesis.getVoices();
+                const preferred = ["Samantha", "Alex", "Google US English", "Microsoft Aria"];
+                const voice = preferred.reduce((f, n) => f || voices.find(v => v.name === n), null)
+                    || voices.find(v => v.lang === "en-US") || voices.find(v => v.lang.startsWith("en"));
+                if (voice) u.voice = voice;
+                window.speechSynthesis.speak(u);
+            };
+            if (window.speechSynthesis.getVoices().length > 0) trySpeak();
+            else { window.speechSynthesis.onvoiceschanged = () => { trySpeak(); window.speechSynthesis.onvoiceschanged = null; }; }
+        }
+
+        function shuffle(arr) {
+            const a = [...arr];
+            for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1));[a[i], a[j]] = [a[j], a[i]]; }
+            return a;
+        }
+
+        // ── Status ────────────────────────────────────────────────────────────────────
+        const STATUS_LABELS = { unlearned: "미학습", learning: "학습중", done: "암기완료" };
+        const STATUS_COLORS = { unlearned: "#e2e8f0", learning: "#fef9c3", done: "#dcfce7" };
+        const STATUS_TEXT = { unlearned: "#475569", learning: "#854d0e", done: "#166534" };
+
+        function StatusBadge({ status }) {
+            return <span style={{ padding: "2px 8px", borderRadius: 99, fontSize: 11, fontWeight: 600, background: STATUS_COLORS[status], color: STATUS_TEXT[status] }}>{STATUS_LABELS[status]}</span>;
+        }
+
+        // ── App ───────────────────────────────────────────────────────────────────────
+        function App() {
+            const [tab, setTab] = useState("list");
+            const [cards, setCards] = useState([]);
+            const [categories, setCategories] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState("");
+
+            const reload = useCallback(async () => {
+                try {
+                    setError("");
+                    const [c, cats] = await Promise.all([db.getCards(), db.getCategories()]);
+                    setCards(c); setCategories(cats);
+                } catch (e) { setError("데이터 로드 실패: " + e.message); }
+                finally { setLoading(false); }
+            }, []);
+
+            useEffect(() => { reload(); }, [reload]);
+
+            const tabs = [
+                { id: "list", label: "📚 카드 목록" },
+                { id: "add", label: "➕ 추가" },
+                { id: "quiz", label: "🧪 퀴즈" },
+                { id: "stats", label: "📊 통계" },
+                { id: "settings", label: "⚙️ 설정" },
+            ];
+
+            if (loading) return (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", flexDirection: "column", gap: 12, color: "#6366f1" }}>
+                    <div style={{ fontSize: 40 }}>📖</div><p>불러오는 중…</p>
+                </div>
+            );
+
+            return (
+                <div style={{ maxWidth: 680, margin: "0 auto", minHeight: "100vh", background: "#f8fafc" }}>
+                    <div style={{ background: "#6366f1", color: "#fff", padding: "16px 20px" }}>
+                        <h1 style={{ fontSize: 20, fontWeight: 700 }}>📖 나의 암기장</h1>
+                        <p style={{ fontSize: 12, opacity: .8, marginTop: 4 }}>총 {cards.length}개 카드</p>
+                    </div>
+                    <div style={{ display: "flex", borderBottom: "1px solid #e2e8f0", background: "#fff" }}>
+                        {tabs.map(t => (
+                            <button key={t.id} onClick={() => setTab(t.id)} style={{
+                                flex: 1, padding: "12px 4px", border: "none", background: "none", cursor: "pointer",
+                                fontSize: 12, fontWeight: 600, color: tab === t.id ? "#6366f1" : "#64748b",
+                                borderBottom: tab === t.id ? "2px solid #6366f1" : "2px solid transparent",
+                            }}>{t.label}</button>
+                        ))}
+                    </div>
+                    {error && <div style={{ background: "#fef2f2", color: "#dc2626", padding: "10px 16px", fontSize: 13 }}>⚠️ {error}</div>}
+                    <div style={{ padding: 16 }}>
+                        {tab === "list" && <ListView cards={cards} categories={categories} reload={reload} />}
+                        {tab === "add" && <AddView categories={categories} reload={reload} onDone={() => setTab("list")} />}
+                        {tab === "quiz" && <QuizView cards={cards} categories={categories} reload={reload} />}
+                        {tab === "stats" && <StatsView cards={cards} categories={categories} />}
+                        {tab === "settings" && <SettingsView />}
+                    </div>
+                </div>
+            );
+        }
+
+        // ── LIST VIEW ─────────────────────────────────────────────────────────────────
+        function ListView({ cards, categories, reload }) {
+            const [search, setSearch] = useState("");
+            const [filterCat, setFilterCat] = useState("전체");
+            const [filterSt, setFilterSt] = useState("전체");
+            const [expanded, setExpanded] = useState(null);
+            const [catModal, setCatModal] = useState(false);
+            const [busy, setBusy] = useState(false);
+
+            const filtered = cards.filter(c => {
+                const mCat = filterCat === "전체" || c.category === filterCat;
+                const mSt = filterSt === "전체" || c.status === filterSt;
+                const mQ = !search ||
+                    c.word?.toLowerCase().includes(search.toLowerCase()) ||
+                    c.meaning?.toLowerCase().includes(search.toLowerCase()) ||
+                    c.title?.toLowerCase().includes(search.toLowerCase()) ||
+                    c.description?.toLowerCase().includes(search.toLowerCase());
+                return mCat && mSt && mQ;
+            });
+
+            async function deleteCard(id) {
+                if (!window.confirm("삭제할까요?")) return;
+                setBusy(true); await db.deleteCard(id); await reload(); setExpanded(null); setBusy(false);
+            }
+
+            async function cycleStatus(id, cur) {
+                const order = ["unlearned", "learning", "done"];
+                const next = order[(order.indexOf(cur) + 1) % order.length];
+                setBusy(true); await db.updateCard(id, { status: next }); await reload(); setBusy(false);
+            }
+
+            return (
+                <div>
+                    <input value={search} onChange={e => setSearch(e.target.value)} placeholder="🔍 검색…" style={inputStyle} />
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                        {["전체", ...categories].map(c => <Chip key={c} active={filterCat === c} onClick={() => setFilterCat(c)}>{c}</Chip>)}
+                        <button onClick={() => setCatModal(true)} style={{ padding: "4px 10px", border: "1px dashed #94a3b8", borderRadius: 99, background: "none", cursor: "pointer", fontSize: 12, color: "#94a3b8" }}>⚙️ 카테고리</button>
+                    </div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                        {["전체", "unlearned", "learning", "done"].map(s => (
+                            <Chip key={s} active={filterSt === s} onClick={() => setFilterSt(s)} small>{s === "전체" ? "전체" : STATUS_LABELS[s]}</Chip>
+                        ))}
+                    </div>
+                    <div style={{ marginTop: 12 }}>
+                        {filtered.length === 0 && <p style={{ color: "#94a3b8", textAlign: "center", padding: 40 }}>카드가 없습니다</p>}
+                        {filtered.map(c => (
+                            <div key={c.id} style={{ background: "#fff", borderRadius: 10, marginBottom: 10, boxShadow: "0 1px 3px #0001", overflow: "hidden" }}>
+                                <div style={{ padding: "12px 14px", cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}
+                                    onClick={() => setExpanded(expanded === c.id ? null : c.id)}>
+                                    <div style={{ flex: 1 }}>
+                                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                            <span style={{ fontWeight: 700, fontSize: 15 }}>{c.type === "word" ? c.word : c.title}</span>
+                                            <StatusBadge status={c.status} />
+                                            <span style={{ fontSize: 11, color: "#94a3b8" }}>{c.category}</span>
+                                        </div>
+                                        {c.type === "word" && <span style={{ fontSize: 13, color: "#64748b" }}>{c.meaning}</span>}
+                                    </div>
+                                    <span style={{ color: "#94a3b8" }}>{expanded === c.id ? "▲" : "▼"}</span>
+                                </div>
+                                {expanded === c.id && (
+                                    <div style={{ borderTop: "1px solid #f1f5f9", padding: "12px 14px", background: "#fafbff" }}>
+                                        {c.type === "word" ? (
+                                            <>
+                                                <button onClick={() => speak(c.word)} style={{ ...btnStyle("#6366f1"), marginBottom: 10 }}>🔊 발음 듣기</button>
+                                                <p style={{ margin: "0 0 8px", fontSize: 13, color: "#475569", fontWeight: 600 }}>예문</p>
+                                                {(c.examples || []).map((ex, i) => <p key={i} style={{ margin: "0 0 6px", fontSize: 13, color: "#334155", lineHeight: 1.6 }}>{i + 1}. {ex}</p>)}
+                                            </>
+                                        ) : (
+                                            <p style={{ margin: 0, fontSize: 13, color: "#334155", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{c.description}</p>
+                                        )}
+                                        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                                            <button disabled={busy} onClick={() => cycleStatus(c.id, c.status)} style={btnStyle("#0ea5e9")}>🔄 상태 변경</button>
+                                            <button disabled={busy} onClick={() => deleteCard(c.id)} style={btnStyle("#ef4444")}>🗑️ 삭제</button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        ))}
+                    </div>
+                    {catModal && <CategoryModal categories={categories} cards={cards} reload={reload} onClose={() => setCatModal(false)} />}
+                </div>
+            );
+        }
+
+        // ── CATEGORY MODAL ────────────────────────────────────────────────────────────
+        function CategoryModal({ categories, cards, reload, onClose }) {
+            const [name, setName] = useState("");
+            const [busy, setBusy] = useState(false);
+            const [msg, setMsg] = useState("");
+
+            async function add() {
+                const n = name.trim();
+                if (!n || categories.includes(n)) return;
+                setBusy(true);
+                try { await db.addCategory(n); await reload(); setName(""); }
+                catch (e) { setMsg("추가 실패: " + e.message); }
+                setBusy(false);
+            }
+
+            async function del(cat) {
+                if (cards.some(c => c.category === cat)) { setMsg("이 카테고리에 카드가 있어 삭제할 수 없어요."); return; }
+                setBusy(true);
+                try { await db.deleteCategory(cat); await reload(); }
+                catch (e) { setMsg("삭제 실패: " + e.message); }
+                setBusy(false);
+            }
+
+            return (
+                <div style={{ position: "fixed", inset: 0, background: "#0006", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999 }}>
+                    <div style={{ background: "#fff", borderRadius: 14, padding: 24, width: 320, maxHeight: "80vh", overflowY: "auto" }}>
+                        <h3 style={{ marginBottom: 16 }}>⚙️ 카테고리 관리</h3>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                            <input value={name} onChange={e => setName(e.target.value)} placeholder="새 카테고리 이름"
+                                style={{ ...inputStyle, margin: 0, flex: 1 }} onKeyDown={e => e.key === "Enter" && add()} />
+                            <button onClick={add} disabled={busy} style={btnStyle("#6366f1")}>추가</button>
+                        </div>
+                        {msg && <p style={{ color: "#dc2626", fontSize: 12, marginBottom: 8 }}>{msg}</p>}
+                        {categories.map(cat => (
+                            <div key={cat} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid #f1f5f9" }}>
+                                <span style={{ fontSize: 14 }}>{cat}</span>
+                                <button onClick={() => del(cat)} disabled={busy} style={{ border: "none", background: "none", cursor: "pointer", color: "#ef4444", fontSize: 13 }}>삭제</button>
+                            </div>
+                        ))}
+                        <button onClick={onClose} style={{ ...btnStyle("#64748b"), marginTop: 16, width: "100%" }}>닫기</button>
+                    </div>
+                </div>
+            );
+        }
+
+        // ── ADD VIEW ──────────────────────────────────────────────────────────────────
+        function AddView({ categories, reload }) {
+            const [type, setType] = useState("word");
+            const [category, setCat] = useState(categories[0] || "");
+            const [word, setWord] = useState("");
+            const [meaning, setMeaning] = useState("");
+            const [examples, setEx] = useState(["", "", ""]);
+            const [title, setTitle] = useState("");
+            const [desc, setDesc] = useState("");
+            const [loading, setLoading] = useState(false);
+            const [msg, setMsg] = useState("");
+
+            async function autoFill() {
+                if (!word.trim()) { setMsg("단어를 먼저 입력해주세요."); return; }
+                setLoading(true); setMsg("AI가 예문을 생성하는 중…");
+                try {
+                    const raw = await callClaude(`영어 단어 "${word.trim()}"에 대해 다음 JSON만 반환해. 다른 텍스트 없이.\n{"meaning":"한국어 뜻","examples":["예문1","예문2","예문3","예문4","예문5"]}`);
+                    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+                    setMeaning(parsed.meaning || ""); setEx((parsed.examples || []).slice(0, 5));
+                    setMsg("✅ 자동 완성 완료!");
+                } catch { setMsg("❌ 생성 실패. 직접 입력해주세요."); }
+                setLoading(false);
+            }
+
+            async function save() {
+                if (type === "word" && (!word.trim() || !meaning.trim())) { setMsg("단어와 뜻을 입력해주세요."); return; }
+                if (type === "concept" && (!title.trim() || !desc.trim())) { setMsg("제목과 설명을 입력해주세요."); return; }
+                setLoading(true);
+                const card = type === "word"
+                    ? { id: Date.now().toString(), type, category, word: word.trim(), meaning: meaning.trim(), examples: examples.filter(Boolean), status: "unlearned" }
+                    : { id: Date.now().toString(), type, category, title: title.trim(), description: desc.trim(), status: "unlearned" };
+                try {
+                    await db.addCard(card); await reload();
+                    setWord(""); setMeaning(""); setEx(["", "", ""]); setTitle(""); setDesc("");
+                    setMsg("✅ 저장됐어요!");
+                } catch (e) { setMsg("❌ 저장 실패: " + e.message); }
+                setLoading(false);
+            }
+
+            return (
+                <div>
+                    <h3 style={{ marginBottom: 14 }}>새 카드 추가</h3>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                        <Chip active={type === "word"} onClick={() => setType("word")}>영어단어</Chip>
+                        <Chip active={type === "concept"} onClick={() => setType("concept")}>개념정리</Chip>
+                    </div>
+                    <label style={labelStyle}>카테고리</label>
+                    <select value={category} onChange={e => setCat(e.target.value)} style={inputStyle}>
+                        {categories.map(c => <option key={c}>{c}</option>)}
+                    </select>
+                    {type === "word" ? (
+                        <>
+                            <label style={labelStyle}>영어 단어</label>
+                            <input value={word} onChange={e => setWord(e.target.value)} placeholder="e.g. ambiguous" style={inputStyle} />
+                            <button onClick={autoFill} disabled={loading} style={{ ...btnStyle("#8b5cf6"), marginBottom: 12, width: "100%" }}>
+                                {loading ? "생성 중…" : "✨ AI 자동완성 (뜻 + 예문)"}
+                            </button>
+                            <label style={labelStyle}>한국어 뜻</label>
+                            <input value={meaning} onChange={e => setMeaning(e.target.value)} placeholder="e.g. 모호한, 애매한" style={inputStyle} />
+                            <label style={labelStyle}>예문 (최대 5개)</label>
+                            {examples.map((ex, i) => (
+                                <input key={i} value={ex} onChange={e => setEx(examples.map((v, j) => j === i ? e.target.value : v))}
+                                    placeholder={`예문 ${i + 1}`} style={{ ...inputStyle, marginBottom: 6 }} />
+                            ))}
+                            {examples.length < 5 && <button onClick={() => setEx([...examples, ""])} style={{ ...btnStyle("#94a3b8"), marginBottom: 12 }}>+ 예문 추가</button>}
+                        </>
+                    ) : (
+                        <>
+                            <label style={labelStyle}>제목</label>
+                            <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. OSI 7계층" style={inputStyle} />
+                            <label style={labelStyle}>설명</label>
+                            <textarea value={desc} onChange={e => setDesc(e.target.value)} placeholder="개념 설명을 입력하세요…"
+                                rows={5} style={{ ...inputStyle, resize: "vertical" }} />
+                        </>
+                    )}
+                    {msg && <p style={{ fontSize: 13, color: msg.startsWith("✅") ? "#16a34a" : "#dc2626", margin: "4px 0 8px" }}>{msg}</p>}
+                    <button onClick={save} disabled={loading} style={{ ...btnStyle("#6366f1"), width: "100%", padding: 12 }}>
+                        {loading ? "저장 중…" : "💾 저장"}
+                    </button>
+                </div>
+            );
+        }
+
+        // ── QUIZ VIEW ─────────────────────────────────────────────────────────────────
+        function QuizView({ cards, categories, reload }) {
+            const [filterCat, setFilterCat] = useState("전체");
+            const [queue, setQueue] = useState(null);
+            const [idx, setIdx] = useState(0);
+            const [revealed, setRev] = useState(false);
+            const [score, setScore] = useState({ correct: 0, wrong: 0 });
+            const [done, setDone] = useState(false);
+
+            const pool = cards.filter(c => filterCat === "전체" || c.category === filterCat);
+
+            function start() {
+                if (!pool.length) return;
+                setQueue(shuffle(pool)); setIdx(0); setRev(false); setScore({ correct: 0, wrong: 0 }); setDone(false);
+            }
+
+            async function answer(correct) {
+                const card = queue[idx];
+                await db.updateCard(card.id, { status: correct ? "done" : "learning" });
+                await reload();
+                setScore(s => ({ ...s, [correct ? "correct" : "wrong"]: s[correct ? "correct" : "wrong"] + 1 }));
+                if (idx + 1 >= queue.length) { setDone(true); return; }
+                setIdx(i => i + 1); setRev(false);
+            }
+
+            if (!queue) return (
+                <div>
+                    <h3 style={{ marginBottom: 14 }}>퀴즈 모드</h3>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+                        {["전체", ...categories].map(c => <Chip key={c} active={filterCat === c} onClick={() => setFilterCat(c)}>{c}</Chip>)}
+                    </div>
+                    <p style={{ color: "#64748b", fontSize: 14 }}>카테고리: <strong>{filterCat}</strong> · {pool.length}개 카드</p>
+                    <button onClick={start} disabled={!pool.length} style={{ ...btnStyle("#6366f1"), width: "100%", padding: 14, fontSize: 16 }}>🚀 퀴즈 시작</button>
+                </div>
+            );
+
+            if (done) return (
+                <div style={{ textAlign: "center", padding: 40 }}>
+                    <p style={{ fontSize: 48 }}>🎉</p>
+                    <h3 style={{ marginBottom: 12 }}>퀴즈 완료!</h3>
+                    <p style={{ fontSize: 18 }}>✅ {score.correct}개 정답 &nbsp; ❌ {score.wrong}개 오답</p>
+                    <p style={{ fontSize: 14, color: "#64748b", marginTop: 8 }}>정답은 "암기완료", 오답은 "학습중"으로 업데이트됐어요.</p>
+                    <button onClick={() => setQueue(null)} style={{ ...btnStyle("#6366f1"), marginTop: 16 }}>다시 설정</button>
+                </div>
+            );
+
+            const card = queue[idx];
+            return (
+                <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+                        <span style={{ fontSize: 13, color: "#64748b" }}>{idx + 1} / {queue.length}</span>
+                        <span style={{ fontSize: 13 }}>✅ {score.correct} ❌ {score.wrong}</span>
+                    </div>
+                    <div style={{ height: 4, background: "#e2e8f0", borderRadius: 99, marginBottom: 20 }}>
+                        <div style={{ height: "100%", width: `${(idx / queue.length) * 100}%`, background: "#6366f1", borderRadius: 99 }} />
+                    </div>
+                    <div style={{ background: "#fff", borderRadius: 14, padding: 28, textAlign: "center", boxShadow: "0 2px 8px #0001", minHeight: 160 }}>
+                        <p style={{ fontSize: 11, color: "#94a3b8", marginBottom: 8 }}>{card.type === "word" ? "이 단어의 뜻은?" : "이 개념을 설명하세요"}</p>
+                        <p style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>{card.type === "word" ? card.word : card.title}</p>
+                        {card.type === "word" && <button onClick={() => speak(card.word)} style={{ ...btnStyle("#8b5cf6"), fontSize: 12 }}>🔊 발음</button>}
+                    </div>
+                    {!revealed ? (
+                        <button onClick={() => setRev(true)} style={{ ...btnStyle("#0ea5e9"), width: "100%", padding: 14, marginTop: 16, fontSize: 15 }}>정답 확인</button>
+                    ) : (
+                        <div>
+                            <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 14, padding: 20, marginTop: 16 }}>
+                                {card.type === "word" ? (
+                                    <>
+                                        <p style={{ marginBottom: 8, fontWeight: 700, fontSize: 18 }}>{card.meaning}</p>
+                                        {(card.examples || []).map((ex, i) => <p key={i} style={{ margin: "4px 0", fontSize: 13, color: "#374151" }}>{i + 1}. {ex}</p>)}
+                                    </>
+                                ) : (
+                                    <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>{card.description}</p>
+                                )}
+                            </div>
+                            <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+                                <button onClick={() => answer(false)} style={{ ...btnStyle("#ef4444"), flex: 1, padding: 14, fontSize: 15 }}>❌ 틀렸어요</button>
+                                <button onClick={() => answer(true)} style={{ ...btnStyle("#22c55e"), flex: 1, padding: 14, fontSize: 15 }}>✅ 맞았어요</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // ── SETTINGS VIEW ─────────────────────────────────────────────────────────────
+        function SettingsView() {
+            const [key, setKey] = useState(localStorage.getItem(OPENAI_KEY_STORAGE) || "");
+            const [show, setShow] = useState(false);
+            const [msg, setMsg] = useState("");
+
+            function save() {
+                const k = key.trim();
+                if (!k) { setMsg("❌ API 키를 입력해주세요."); return; }
+                localStorage.setItem(OPENAI_KEY_STORAGE, k);
+                setMsg("✅ 저장됐어요! 이제 AI 자동완성을 사용할 수 있어요.");
+            }
+
+            function clear() {
+                localStorage.removeItem(OPENAI_KEY_STORAGE);
+                setKey(""); setMsg("🗑️ API 키가 삭제됐어요.");
+            }
+
+            const saved = !!localStorage.getItem(OPENAI_KEY_STORAGE);
+
+            return (
+                <div>
+                    <h3 style={{ marginBottom: 16 }}>⚙️ 설정</h3>
+                    <div style={{ background: "#fff", borderRadius: 14, padding: 24, boxShadow: "0 1px 3px #0001" }}>
+                        <p style={{ fontWeight: 600, marginBottom: 6 }}>OpenAI API 키</p>
+                        <p style={{ fontSize: 13, color: "#64748b", marginBottom: 14, lineHeight: 1.6 }}>
+                            AI 자동완성(뜻 + 예문 생성)에 사용돼요.<br />
+                            키는 이 기기의 브라우저에만 저장되며 외부로 전송되지 않아요.
+                        </p>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                            <input
+                                type={show ? "text" : "password"}
+                                value={key}
+                                onChange={e => setKey(e.target.value)}
+                                placeholder="sk-proj-..."
+                                style={{ ...inputStyle, margin: 0, flex: 1, fontFamily: "monospace", fontSize: 12 }}
+                            />
+                            <button onClick={() => setShow(s => !s)} style={{ ...btnStyle("#94a3b8"), whiteSpace: "nowrap" }}>
+                                {show ? "숨기기" : "보기"}
+                            </button>
+                        </div>
+                        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                            <button onClick={save} style={{ ...btnStyle("#6366f1"), flex: 1 }}>💾 저장</button>
+                            {saved && <button onClick={clear} style={{ ...btnStyle("#ef4444") }}>🗑️ 삭제</button>}
+                        </div>
+                        {msg && <p style={{ fontSize: 13, marginTop: 10, color: msg.startsWith("✅") ? "#16a34a" : msg.startsWith("🗑️") ? "#64748b" : "#dc2626" }}>{msg}</p>}
+                        {saved && !msg && <p style={{ fontSize: 12, color: "#16a34a", marginTop: 10 }}>✅ API 키가 저장되어 있어요.</p>}
+                    </div>
+                    <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 12, padding: 16, marginTop: 14 }}>
+                        <p style={{ fontSize: 13, color: "#92400e", lineHeight: 1.7 }}>
+                            ⚠️ API 키 보안 주의사항<br />
+                            • 키를 타인과 공유하지 마세요<br />
+                            • 공용 PC에서는 사용 후 반드시 삭제해주세요<br />
+                            • 키 유출 시 <a href="https://platform.openai.com/api-keys" target="_blank" style={{ color: "#6366f1" }}>platform.openai.com</a> 에서 즉시 폐기하세요
+                        </p>
+                    </div>
+                </div>
+            );
+        }
+
+        // ── STATS VIEW ────────────────────────────────────────────────────────────────
+        function StatsView({ cards, categories }) {
+            const total = cards.length;
+            const done = cards.filter(c => c.status === "done").length;
+            const learning = cards.filter(c => c.status === "learning").length;
+            const unlearn = cards.filter(c => c.status === "unlearned").length;
+            const pct = total ? Math.round((done / total) * 100) : 0;
+            const byCat = categories.map(cat => {
+                const cc = cards.filter(c => c.category === cat);
+                return { cat, total: cc.length, done: cc.filter(c => c.status === "done").length };
+            });
+
+            return (
+                <div>
+                    <h3 style={{ marginBottom: 16 }}>📊 학습 통계</h3>
+                    <div style={{ background: "#fff", borderRadius: 14, padding: 24, marginBottom: 14, boxShadow: "0 1px 3px #0001" }}>
+                        <p style={{ marginBottom: 10, fontWeight: 600 }}>전체 진행률</p>
+                        <div style={{ height: 14, background: "#e2e8f0", borderRadius: 99, overflow: "hidden" }}>
+                            <div style={{ height: "100%", width: `${pct}%`, background: "#6366f1", borderRadius: 99, transition: "width .4s" }} />
+                        </div>
+                        <p style={{ marginTop: 8, fontSize: 13, color: "#64748b" }}>{done} / {total}개 암기완료 ({pct}%)</p>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 14 }}>
+                        {[["미학습", unlearn, "#e2e8f0", "#475569"], ["학습중", learning, "#fef9c3", "#854d0e"], ["암기완료", done, "#dcfce7", "#166634"]].map(([l, n, bg, col]) => (
+                            <div key={l} style={{ background: bg, borderRadius: 12, padding: "16px 12px", textAlign: "center" }}>
+                                <p style={{ fontSize: 24, fontWeight: 700, color: col }}>{n}</p>
+                                <p style={{ fontSize: 12, color: col, marginTop: 4 }}>{l}</p>
+                            </div>
+                        ))}
+                    </div>
+                    <h4 style={{ marginBottom: 10 }}>카테고리별</h4>
+                    {byCat.map(({ cat, total: t, done: d }) => (
+                        <div key={cat} style={{ background: "#fff", borderRadius: 10, padding: "12px 16px", marginBottom: 8, boxShadow: "0 1px 3px #0001" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                                <span style={{ fontWeight: 600, fontSize: 14 }}>{cat}</span>
+                                <span style={{ fontSize: 13, color: "#64748b" }}>{d}/{t}</span>
+                            </div>
+                            <div style={{ height: 6, background: "#e2e8f0", borderRadius: 99 }}>
+                                <div style={{ height: "100%", width: t ? `${(d / t) * 100}%` : "0%", background: "#6366f1", borderRadius: 99 }} />
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            );
+        }
+
+        // ── Shared UI ─────────────────────────────────────────────────────────────────
+        function Chip({ active, onClick, children, small }) {
+            return (
+                <button onClick={onClick} style={{
+                    padding: small ? "3px 10px" : "5px 14px", borderRadius: 99, border: "none",
+                    cursor: "pointer", fontSize: small ? 11 : 13, fontWeight: 600,
+                    background: active ? "#6366f1" : "#e2e8f0", color: active ? "#fff" : "#475569",
+                }}>{children}</button>
+            );
+        }
+
+        const inputStyle = { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 14, marginBottom: 12, boxSizing: "border-box", outline: "none" };
+        const labelStyle = { display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 4 };
+        function btnStyle(bg) { return { padding: "8px 14px", borderRadius: 8, border: "none", cursor: "pointer", background: bg, color: "#fff", fontWeight: 600, fontSize: 13 }; }
+
+        ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+</body>
+
+</html>
